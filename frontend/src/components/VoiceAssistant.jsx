@@ -214,8 +214,7 @@ export default function VoiceAssistant() {
   const streamRef = useRef(null);
   const audioCtxRef = useRef(null);
   const analyserRef = useRef(null);
-  const recorderRef = useRef(null);   // one recorder for the whole session
-  const collectingRef = useRef(false); // true only while we want audio data
+  const recorderRef = useRef(null);
   const chunksRef = useRef([]);
   const vadIntervalRef = useRef(null);
   const silenceTimerRef = useRef(null);
@@ -261,16 +260,6 @@ export default function VoiceAssistant() {
       silentGain.connect(ctx.destination);
       analyserRef.current = analyser;
 
-      // One MediaRecorder that runs the WHOLE session — no stop/start per turn
-      const recorder = new MediaRecorder(stream);
-      recorder.ondataavailable = (e) => {
-        if (collectingRef.current && e.data.size > 0) {
-          chunksRef.current.push(e.data);
-        }
-      };
-      recorder.start(100);
-      recorderRef.current = recorder;
-
       activeRef.current = true;
       beginListening();
     } catch {
@@ -285,13 +274,10 @@ export default function VoiceAssistant() {
 
   const teardown = () => {
     isStartingRef.current = false;
-    collectingRef.current = false;
     activeRef.current = false;
     clearInterval(vadIntervalRef.current);
     clearTimeout(silenceTimerRef.current);
-    try {
-      if (recorderRef.current?.state !== "inactive") recorderRef.current?.stop();
-    } catch { /* ignore */ }
+    try { recorderRef.current?.stop(); } catch { /* ignore */ }
     streamRef.current?.getTracks().forEach((t) => t.stop());
     audioCtxRef.current?.close();
     streamRef.current = null;
@@ -316,12 +302,19 @@ export default function VoiceAssistant() {
     }
     if (!activeRef.current) return; // session may have ended while awaiting
 
-    // Open a fresh collection window — recorder is already running
+    // Fresh recorder per turn — each gets its own complete WebM container
     chunksRef.current = [];
     speechChunkCountRef.current = 0;
-    collectingRef.current = true;
     clearTimeout(silenceTimerRef.current);
     silenceTimerRef.current = null;
+
+    const recorder = new MediaRecorder(streamRef.current);
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) chunksRef.current.push(e.data);
+    };
+    recorder.onstop = onRecorderStop;
+    recorder.start(100);
+    recorderRef.current = recorder;
 
     clearInterval(vadIntervalRef.current);
     vadIntervalRef.current = setInterval(runVAD, 100);
@@ -360,19 +353,16 @@ export default function VoiceAssistant() {
   };
 
   const commitAudio = () => {
-    // Stop collecting — recorder keeps running, we just ignore new chunks
-    collectingRef.current = false;
     clearInterval(vadIntervalRef.current);
     clearTimeout(silenceTimerRef.current);
     silenceTimerRef.current = null;
     setSessionState("processing");
-    // Wait ~150 ms for any in-flight ondataavailable callbacks to land
-    setTimeout(processRecording, 150);
+    try { recorderRef.current?.stop(); } catch { /* ignore */ }
   };
 
   // ── Audio handling ────────────────────────────────────────────────────────
 
-  const processRecording = async () => {
+  const onRecorderStop = async () => {
     if (!activeRef.current) return;
 
     const blob = new Blob(chunksRef.current, { type: "audio/webm" });
