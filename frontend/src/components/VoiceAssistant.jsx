@@ -261,7 +261,7 @@ export default function VoiceAssistant() {
       analyserRef.current = analyser;
 
       activeRef.current = true;
-      beginListening();
+      await beginListening();
     } catch {
       teardown();
       setError(
@@ -296,8 +296,26 @@ export default function VoiceAssistant() {
   const beginListening = async () => {
     if (!activeRef.current) return;
 
+    // Re-acquire mic if Chrome ended the tracks (can happen after recorder.stop())
+    const tracks = streamRef.current?.getTracks() ?? [];
+    if (tracks.length === 0 || tracks.some((t) => t.readyState === "ended")) {
+      try {
+        const newStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        streamRef.current = newStream;
+        // Plug new source into the existing audio graph (analyser → silentGain → dest)
+        const source = audioCtxRef.current.createMediaStreamSource(newStream);
+        source.connect(analyserRef.current);
+      } catch {
+        teardown();
+        setError("Microphone access lost. Please restart the session.");
+        setSessionState("idle");
+        return;
+      }
+    }
+    if (!activeRef.current) return;
+
     // Await resume so the analyser has real data before VAD starts polling
-    if (audioCtxRef.current && audioCtxRef.current.state !== "running") {
+    if (audioCtxRef.current?.state !== "running") {
       await audioCtxRef.current.resume();
     }
     if (!activeRef.current) return; // session may have ended while awaiting
@@ -308,7 +326,17 @@ export default function VoiceAssistant() {
     clearTimeout(silenceTimerRef.current);
     silenceTimerRef.current = null;
 
-    const recorder = new MediaRecorder(streamRef.current);
+    let recorder;
+    try {
+      recorder = new MediaRecorder(streamRef.current);
+    } catch (err) {
+      console.error("MediaRecorder creation failed:", err);
+      teardown();
+      setError("Recording unavailable. Please restart the session.");
+      setSessionState("idle");
+      return;
+    }
+
     recorder.ondataavailable = (e) => {
       if (e.data.size > 0) chunksRef.current.push(e.data);
     };
@@ -370,7 +398,7 @@ export default function VoiceAssistant() {
 
     // Too short — treat as noise, go back to listening
     if (blob.size < 800 || speechChunkCountRef.current < MIN_SPEECH_CHUNKS) {
-      beginListening();
+      await beginListening();
       return;
     }
 
@@ -403,13 +431,13 @@ export default function VoiceAssistant() {
       // Brief pause so mic doesn't immediately pick up room echo from speaker
       await new Promise((r) => setTimeout(r, POST_PLAY_PAUSE_MS));
 
-      if (activeRef.current) beginListening();
+      if (activeRef.current) await beginListening();
     } catch (err) {
       if (!activeRef.current) return;
       const detail =
         err.response?.data?.detail || "Something went wrong. Listening again…";
       setError(detail);
-      if (activeRef.current) beginListening();
+      if (activeRef.current) await beginListening();
     }
   };
 
